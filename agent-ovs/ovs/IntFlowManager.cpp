@@ -30,6 +30,7 @@
 #include <modelgbp/gbpe/EpToSvcCounter.hpp>
 #include <modelgbp/observer/SvcStatUniverse.hpp>
 #include <modelgbp/fault/SeverityEnumT.hpp>
+#include <modelgbp/inv/NextHopLink.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
@@ -1411,6 +1412,25 @@ bool getHostAccess(EndpointManager& epMgr,
     return false;
 }
 
+uint32_t getProxyTunnelId(opflex::ofcore::OFFramework& framework,
+                          optional<URI> rdURI) {
+    uint32_t proxyTunId = 0;
+    optional<shared_ptr<RoutingDomain>> rd;
+    optional<shared_ptr<modelgbp::gbpe::InstContext>> rdInst;
+
+    if (rdURI) {
+        rd = RoutingDomain::resolve(framework, rdURI.get());
+        if (rd) {
+            rdInst = rd.get()->resolveGbpeInstContext();
+            if (rdInst && rdInst.get()->getEncapId())
+                proxyTunId = rdInst.get()->getEncapId().get();
+        }
+    }
+    if (proxyTunId == 0)
+        LOG(ERROR) << "Failed to get encapId for " << rdURI;
+    return proxyTunId;
+}
+
 void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
     LOG(DEBUG) << "Updating remote endpoint " << uuid;
 
@@ -1430,11 +1450,18 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
     if (hasMac)
         ep.get()->getMac().get().toUIntArray(macAddr);
 
+    // Get proxy MAC
+    uint8_t proxyMacAddr[6];
+    bool hasProxyMac = ep.get()->isProxyMacSet();
+    if (hasProxyMac)
+        ep.get()->getProxyMac().get().toUIntArray(proxyMacAddr);
+
     boost::system::error_code ec;
 
     // Get remote tunnel destination
-    optional<address> tunDst;
     bool hasTunDest = false;
+    optional<address> tunDst;
+    std::vector<address> tunDsts;
     if (ep.get()->isNextHopTunnelSet()) {
         string ipStr = ep.get()->getNextHopTunnel().get();
         tunDst = address::from_string(ipStr, ec);
@@ -1442,8 +1469,28 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
             LOG(WARNING) << "Invalid remote tunnel destination IP: "
                          << ipStr << ": " << ec.message();
         } else {
+            tunDsts.push_back(tunDst.get());
             hasTunDest = true;
         }
+    }
+
+    // Check if the ep has multiple tunnel destinations
+    if (!hasTunDest) {
+        vector<shared_ptr<modelgbp::inv::NextHopLink>> tnls;
+        ep.get()->resolveInvNextHopLink(tnls);
+        for (shared_ptr<modelgbp::inv::NextHopLink>& tnl : tnls) {
+            if (tnl->isIpSet()) {
+                string ipStr = tnl->getIp().get();
+                tunDst = address::from_string(ipStr, ec);
+                if (ec || !tunDst->is_v4()) {
+                    LOG(WARNING) << "Invalid remote tunnel destination IP: "
+                                 << ipStr << ": " << ec.message();
+                } else {
+                   tunDsts.push_back(tunDst.get());
+                }
+            }
+        }
+        hasTunDest = !tunDsts.empty();
     }
 
     uint32_t epgVnid = 0, rdId = 0, bdId = 0, fgrpId = 0;
@@ -1466,33 +1513,41 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
 
     if (hasForwardingInfo) {
         FlowBuilder bridgeFlow;
-        uint32_t outReg = 0;
         uint64_t meta;
         uint32_t hostPort = OFPP_NONE;
+        uint32_t proxyTunId = 0;
         bool hasHostMac = false;
         uint8_t hostMac[6];
 
         if (hasTunDest) {
-            outReg = tunDst->to_v4().to_ulong();
-            meta = flow::meta::out::REMOTE_TUNNEL;
+            if (hasProxyMac) {
+                if ((proxyTunId =
+                     getProxyTunnelId(agent.getFramework(), rdURI)) == 0)
+                     return;
+                meta = flow::meta::out::REMOTE_TUNNEL_PROXY;
+            } else {
+                meta = flow::meta::out::REMOTE_TUNNEL;
+            }
         } else {
             meta = flow::meta::out::HOST_ACCESS;
             hasHostMac = getHostAccess(agent.getEndpointManager(),
                                        switchManager, hostPort, hostMac);
         }
 
-        if (hasMac) {
-            matchDestDom(bridgeFlow, bdId, 0)
-                .priority(10)
-                .ethDst(macAddr)
-                .action()
-                .reg(MFF_REG2, epgVnid)
-                .reg(MFF_REG7, outReg)
-                .metadata(meta, flow::meta::out::MASK)
-                .go(POL_TABLE_ID)
-                .parent().build(elBridgeDst);
+        if (hasMac && hasTunDest) {
+            // There will only be one such entry
+            for (auto &it : tunDsts) {
+                matchDestDom(bridgeFlow, bdId, 0)
+                    .priority(10)
+                    .ethDst(macAddr)
+                    .action()
+                    .reg(MFF_REG2, epgVnid)
+                    .reg(MFF_REG7, it.to_v4().to_ulong())
+                    .metadata(meta, flow::meta::out::MASK)
+                    .go(POL_TABLE_ID)
+                    .parent().build(elBridgeDst);
+            }
         }
-
 
         // Get remote endpoint IP addresses
         ep.get()->resolveInvRemoteIp(invIps);
@@ -1516,19 +1571,39 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
                     prefix = 128;
             }
 
-            FlowBuilder routeFlow;
-            FlowBuilder proxyArp;
             if (hasTunDest) {
-                matchDestDom(routeFlow, 0, rdId)
-                    .priority(500)
-                    .ethDst(getRouterMacAddr())
-                    .ipDst(addr, prefix)
-                    .action()
-                    .reg(MFF_REG2, epgVnid)
-                    .reg(MFF_REG7, outReg)
-                    .metadata(meta, flow::meta::out::MASK)
-                    .go(POL_TABLE_ID)
-                    .parent().build(elRouteDst);
+                for (auto &it : tunDsts) {
+                    FlowBuilder routeFlow;
+                    if (hasProxyMac) {
+                        uint32_t tunPort = getTunnelPort();
+                        actionSource(matchEpg(FlowBuilder()
+                                              .priority(149)
+                                              .inPort(tunPort),
+                                     encapType,
+                                     proxyTunId), epgVnid,
+                                     bdId, fgrpId, rdId,
+                                     IntFlowManager::SERVICE_REV_TABLE_ID,
+                                     encapType)
+                            .outerIpSrc(it, 32)
+                            .ipSrc(addr, prefix)
+                            .build(elSrc);
+
+                        routeFlow
+                        .action()
+                        .reg(MFF_REG3, proxyTunId)
+                        .ethSrc(getRouterMacAddr()).ethDst(proxyMacAddr);
+                    }
+                    matchDestDom(routeFlow, 0, rdId)
+                        .priority(500)
+                        .ethDst(getRouterMacAddr())
+                        .ipDst(addr, prefix)
+                        .action()
+                        .reg(MFF_REG2, epgVnid)
+                        .reg(MFF_REG7, it.to_v4().to_ulong())
+                        .metadata(meta, flow::meta::out::MASK)
+                        .go(POL_TABLE_ID)
+                        .parent().build(elRouteDst);
+                }
             } else {
                 /*
                  * ingress (=> pod) uses veth_host mac and inPort
@@ -1549,6 +1624,7 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
                          .build(elSrc);
                 }
                 // egress (<= pod)
+                FlowBuilder routeFlow;
                 routeFlow
                     .priority(10 + prefix)
                     .ethType(eth::type::IP)
@@ -1562,23 +1638,14 @@ void IntFlowManager::handleRemoteEndpointUpdate(const string& uuid) {
                     .parent().build(elRouteDst);
             }
 
+            FlowBuilder proxyArp;
             if (addr.is_v4()) {
-                if (hasMac && prefix == 32) {
+                if (hasMac) {
                     // Resolve inter-node arp without going to leaf
-                    matchDestArp(proxyArp.priority(40), addr, bdId, rdId);
-                    actionArpReply(proxyArp, macAddr, addr)
-                        .build(elBridgeDst);
-                }
-                if (invIp->isNextHopIPSet() && invIp->isNextHopMacSet()) {
-                    uint8_t nextHopMac[6];
-                    address nextHopIP =
-                        address::from_string(invIp->getNextHopIP().get(), ec);
-                    if (ec) continue;
-                    invIp->getNextHopMac().get().toUIntArray(nextHopMac);
-                    // Resolve arp to CSR Gateway
+                    // For hybrid cloud this is mac address of CSR
                     matchDestArp(proxyArp.priority(40), addr, bdId, rdId,
                                  prefix);
-                    actionArpReply(proxyArp, nextHopMac, nextHopIP)
+                    actionArpReply(proxyArp, macAddr, addr)
                         .build(elBridgeDst);
                 }
             }
@@ -4866,6 +4933,14 @@ void IntFlowManager::createStaticFlows() {
                 .regMove(MFF_REG7, MFF_TUN_DST)
                 .output(tunPort)
                 .parent().build(outFlows);
+            FlowBuilder().priority(15)
+                .metadata(flow::meta::out::REMOTE_TUNNEL_PROXY,
+                          flow::meta::out::MASK)
+                .action()
+                .regMove(MFF_REG3, MFF_TUN_ID)
+                .regMove(MFF_REG7, MFF_TUN_DST)
+                .output(tunPort)
+                .parent().build(outFlows);
         }
         {
             // send reverse NAT ICMP error packets to controller
@@ -5278,7 +5353,6 @@ void IntFlowManager::handleRoutingDomainUpdate(const URI& rdURI) {
         agent.getPolicyManager().deleteRoutingDomain(rdURI);
         return;
     }
-    LOG(DEBUG) << "Updating routing domain " << rdURI;
 #ifdef HAVE_PROMETHEUS_SUPPORT
     prometheusManager.addNUpdateRDDropCounter(rdURI.toString(),
                                               true, 0, 0);
@@ -5289,6 +5363,8 @@ void IntFlowManager::handleRoutingDomainUpdate(const URI& rdURI) {
     boost::system::error_code ec;
     uint32_t tunPort = getTunnelPort();
     uint32_t rdId = getId(RoutingDomain::CLASS_ID, rdURI);
+    LOG(DEBUG) << "Updating routing domain " << rdURI
+               << " ID " << rdId;
 
     /* VRF unenforced mode:
      * In this mode, inter epg communication is allowed without any
