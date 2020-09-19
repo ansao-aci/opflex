@@ -1,4 +1,5 @@
 /* -*- C++ -*-; c-basic-offset: 4; indent-tabs-mode: nil */
+
 /*
  * Implementation for QosManager class.
  *
@@ -25,6 +26,7 @@ namespace opflexagent {
     using boost::optional;
     using opflex::modb::class_id_t;
     using opflex::modb::URI;
+    using namespace modelgbp::gbp;
 
     recursive_mutex QosManager::qos_mutex;
 
@@ -43,6 +45,9 @@ namespace opflexagent {
         agent.getEndpointManager().registerListener(this);
         Requirement::registerListener(framework, &qosUniverseListener);
         BandwidthLimit::registerListener(framework, &qosUniverseListener);
+        EpGroup::registerListener(framework, &qosUniverseListener);
+        EpGroupToQosRSrc::registerListener(framework, &qosUniverseListener);
+        DscpMarking::registerListener(framework, &qosUniverseListener);
     }
 
     void QosManager::stop() {
@@ -51,6 +56,9 @@ namespace opflexagent {
         agent.getEndpointManager().unregisterListener(this);
         Requirement::unregisterListener(framework, &qosUniverseListener);
         BandwidthLimit::unregisterListener(framework, &qosUniverseListener);
+        EpGroup::unregisterListener(framework, &qosUniverseListener);
+        EpGroupToQosRSrc::unregisterListener(framework, &qosUniverseListener);
+        DscpMarking::unregisterListener(framework, &qosUniverseListener);
     }
 
 
@@ -72,11 +80,8 @@ namespace opflexagent {
                 vector <shared_ptr<modelgbp::qos::Requirement>> qosVec;
                 config_opt.get()->resolveQosRequirement(qosVec);
                 for (const shared_ptr <modelgbp::qos::Requirement>& qosReq : qosVec) {
-                    auto itr = qosmanager.reqToInterface.find(qosReq->getURI());
-                    if (itr == qosmanager.reqToInterface.end()) {
-                        LOG(DEBUG) << "creating qos config " << qosReq->getURI();
-                        processQosConfig(qosReq);
-                    }
+                    LOG(DEBUG) << "creating qos config " << qosReq->getURI();
+                    processQosConfig(qosReq);
                     qosmanager.notifyUpdate.insert(qosReq->getURI());
                 }
             }
@@ -87,57 +92,78 @@ namespace opflexagent {
                 processQosConfig(qosReqOpt.get());
                 qosmanager.notifyUpdate.insert(uri);
             }
-
         } else if (classId == modelgbp::qos::BandwidthLimit::CLASS_ID){
             optional<shared_ptr<modelgbp::qos::BandwidthLimit>> qosBandwidthOpt =
                 modelgbp::qos::BandwidthLimit::resolve(qosmanager.framework, uri);
-
             if (qosBandwidthOpt){
                 const shared_ptr<modelgbp::qos::BandwidthLimit> &qosBandwidth =
                     qosBandwidthOpt.get();
-
                 LOG(INFO) << "Bandwidth receieved burst: " << qosBandwidth->getBurst()
                     << " rate: "<< qosBandwidth->getRate();
                 processQosConfig(qosBandwidth);
                 qosmanager.notifyUpdate.insert(uri);
             }
+        } else if (classId == modelgbp::gbp::EpGroup::CLASS_ID) {
+            optional<shared_ptr<modelgbp::gbp::EpGroup>> epg =
+                modelgbp::gbp::EpGroup::resolve(qosmanager.framework, uri);
+            if (epg) {
+                optional<shared_ptr<modelgbp::gbp::EpGroupToQosRSrc>> epgRsReqOpt =
+                    epg.get()->resolveGbpEpGroupToQosRSrc();
+                if (epgRsReqOpt){
+                    optional<URI> reqUriOpt = epgRsReqOpt.get()->getTargetURI();
+                    if (reqUriOpt) {
+                        LOG(INFO) << "EPG-QOS policy updated. EPG: " << uri.toString()
+                            << "; Qos: " << reqUriOpt.get().toString();
+                        qosmanager.updateEpgPolicyMap(uri, reqUriOpt.get());
+                        qosmanager.notifyUpdate.insert(uri);
+                    }
+                }
+            }
+
+        } else if (classId == modelgbp::qos::DscpMarking::CLASS_ID) {
+            optional<shared_ptr<modelgbp::qos::DscpMarking>> qosDscpMarkingOpt =
+                modelgbp::qos::DscpMarking::resolve(qosmanager.framework, uri);
+
+            string dscpMarking("QosDscpMarking/");
+            string dscpMarkingUri(uri.toString());
+            dscpMarkingUri.erase(dscpMarkingUri.length()-dscpMarking.size());
+            URI reqUri(dscpMarkingUri);
+            LOG(INFO) << "Dscp-req: "<<reqUri;
+
+            qosmanager.notifyUpdate.insert(reqUri);
+            if (qosDscpMarkingOpt){
+                const shared_ptr<modelgbp::qos::DscpMarking> &qosDscpMarking =
+                     qosDscpMarkingOpt.get();
+                LOG(INFO) << "DscpMarking: " << qosDscpMarking->getMark().get();
+                processQosConfig(qosDscpMarking);
+            } else {
+                qosmanager.reqToDscp.erase(reqUri);
+            }
+        }
+        else if (classId == modelgbp::gbp::EpGroupToQosRSrc::CLASS_ID) {
+            optional<shared_ptr<modelgbp::gbp::EpGroupToQosRSrc>> epgRs =
+                modelgbp::gbp::EpGroupToQosRSrc::resolve(qosmanager.framework, uri);
+            if (!epgRs) {
+                string rsQos("GbpEpGroupToQosRSrc/");
+                string mEpgUri (uri.toString());
+                mEpgUri.erase(mEpgUri.length()-rsQos.size());
+
+                URI mUri(mEpgUri);
+                LOG(INFO) << "modified epgUri: "<< mUri;
+
+                qosmanager.notifyUpdate.insert(mUri);
+                qosmanager.clearEpgEntry(mUri);
+            }
         }
 
         for (const URI& updatedUri : qosmanager.notifyUpdate) {
-
-            auto itr = qosmanager.ingressPolInterface.find(updatedUri);
-            if (itr != qosmanager.ingressPolInterface.end()){
-                unordered_set<string> &interfaces = itr->second;
-                for( const string& interface : interfaces){
-                    string taskId = updatedUri.toString()+ interface + INGRESS;
-                    qosmanager.taskQueue.dispatch(taskId, [=]() {
-                            qosmanager.notifyListeners(interface, INGRESS);
-                            });
-                }
-            }
-
-
-            itr = qosmanager.egressPolInterface.find(updatedUri);
-            if (itr != qosmanager.egressPolInterface.end()){
-                unordered_set<string> &interfaces = itr->second;
-                for( const string& interface : interfaces){
-                    string taskId = updatedUri.toString() + interface + EGRESS;
-                    qosmanager.taskQueue.dispatch(taskId, [=]() {
-                            qosmanager.notifyListeners(interface, EGRESS);
-                            });
-                }
-            }
-
-            itr = qosmanager.reqToInterface.find(updatedUri);
-            if (itr != qosmanager.reqToInterface.end()){
-                unordered_set<string> &interfaces = itr->second;
-                for( const string& interface : interfaces){
-                    string taskId = updatedUri.toString() + interface + BOTH;
-                    qosmanager.taskQueue.dispatch(taskId, [=]() {
-                            qosmanager.notifyListeners(interface, BOTH);
-                            });
-                }
-            }
+            processModbUpdate(updatedUri, INGRESS, qosmanager.ingressPolInterface);
+            processModbUpdate(updatedUri, EGRESS, qosmanager.egressPolInterface);
+            processModbUpdate(updatedUri, BOTH, qosmanager.reqToInterface);
+            processModbUpdate(updatedUri, BOTH, qosmanager.epgToInterface);
+            processModbUpdate(updatedUri, INGRESS, qosmanager.ingressPolEpg);
+            processModbUpdate(updatedUri, EGRESS, qosmanager.egressPolEpg);
+            processModbUpdate(updatedUri, BOTH, qosmanager.reqToEpg);
         }
         qosmanager.notifyUpdate.clear();
     }
@@ -158,14 +184,37 @@ namespace opflexagent {
         const Endpoint& endpoint = *epWrapper.get();
         const optional<URI>& epQosPol = endpoint.getQosPolicy();
         const optional<string>& ofPortName = endpoint.getAccessInterface();
+        const optional<URI>& egUri = endpoint.getEgURI();
 
-        if (epQosPol && ofPortName){
+        if (ofPortName){
             const string &interface = ofPortName.get();
-            const URI &newReq = epQosPol.get();
-            updateInterfacePolicyMap(interface, newReq);
+            LOG(DEBUG) << "Handle update for interface: " << interface;
 
-            LOG(DEBUG) << "Interface:  " << ofPortName.get() << ", RequirementUri: " << epQosPol.get().toString();
-            notifyListeners(ofPortName.get(), BOTH);
+            if (epQosPol) {
+                const URI newReq = epQosPol.get();
+                updateInterfacePolicyMap(interface, newReq);
+                LOG(DEBUG) << "EpQosUri: " << epQosPol.get().toString();
+            } else {
+                auto itr = interfaceToReq.find(interface);
+                if (itr != interfaceToReq.end()) {
+                    clearInterfaceEntry(interface);
+                }
+            }
+
+            auto itr = interfaceToEpg.find(interface);
+            if (itr != interfaceToEpg.end()) {
+                optional<URI> oldEgUri = itr->second;
+                interfaceToEpg.erase(itr);
+                clearEntry(interface, oldEgUri.get(), epgToInterface);
+            }
+
+            if (egUri) {
+                const URI epg = egUri.get();
+                interfaceToEpg.insert(make_pair(interface, epg));
+                addEntry(interface, epg, epgToInterface);
+                LOG(DEBUG) << "epg found for interface: " << epg;
+            }
+            notifyListeners(interface, "Both");
         }
     }
 
@@ -182,6 +231,12 @@ namespace opflexagent {
 
     void QosManager::notifyListeners(const string& interface, const string& direction) {
         lock_guard<mutex> guard1(listener_mutex);
+
+        if (direction == BOTH) {
+            for (QosListener *listener : qosListeners) {
+                listener->dscpQosUpdated(interface);
+            }
+        }
 
         if (direction == EGRESS || direction == BOTH){
             for (QosListener *listener : qosListeners) {
@@ -208,6 +263,19 @@ namespace opflexagent {
         }
     }
 
+    int QosManager::getDscpMarking(const string& interface) const {
+        auto itr = interfaceToReq.find(interface);
+        if (itr != interfaceToReq.end()){
+            URI reqUri = itr->second;
+            auto itr2 = reqToDscp.find(reqUri);
+            if (itr2 != reqToDscp.end()){
+                return itr2->second;
+            }
+        }
+        return 0;
+    }
+
+
     optional<shared_ptr<QosConfigState>>
         QosManager::getQosConfigState(const URI& uri) const {
             lock_guard<recursive_mutex> guard1(qos_mutex);
@@ -222,24 +290,42 @@ namespace opflexagent {
     optional<shared_ptr<QosConfigState>>
         QosManager::getQosConfig(const string& interface, bool egress) const {
             lock_guard<recursive_mutex> guard1(qos_mutex);
-            auto itr = interfaceToReq.find(interface);
-            if (itr == interfaceToReq.end()) {
-                return boost::none;
-            } else {
-                const URI& reqUri = itr->second;
-                auto polIter = reqToPol.find(reqUri);
-                if (polIter == reqToPol.end()) {
-                    return boost::none;
-                }
+            optional<URI> reqUri = boost::none;
 
-                pair<boost::optional<URI>, boost::optional<URI> > pols = polIter->second;
-                if (egress && pols.first) {
-                    return getQosConfigState(pols.first.get());
-                } else if (!egress && pols.second){
-                    return getQosConfigState(pols.second.get());
-                } else {
-                    return boost::none;
+            if (!reqUri) {
+                auto itr1 = interfaceToReq.find(interface);
+                if (itr1 != interfaceToReq.end()) {
+                    reqUri = itr1->second;
                 }
+            }
+
+            if (!reqUri) {
+                auto itr1 = interfaceToEpg.find(interface);
+                if (itr1 != interfaceToEpg.end()) {
+                    const URI& epg = itr1->second;
+                    auto itr2 = epgToReq.find(epg);
+                    if (itr2 != epgToReq.end()) {
+                        reqUri = itr2->second;
+                    }
+                }
+            }
+
+            if (!reqUri) {
+                return boost::none;
+            }
+
+            auto polIter = reqToPol.find(reqUri.get());
+            if (polIter == reqToPol.end()) {
+                return boost::none;
+            }
+
+            pair<boost::optional<URI>, boost::optional<URI> > pols = polIter->second;
+            if (egress && pols.first) {
+                return getQosConfigState(pols.first.get());
+            } else if (!egress && pols.second){
+                return getQosConfigState(pols.second.get());
+            } else {
+                return boost::none;
             }
         }
 
@@ -252,6 +338,22 @@ namespace opflexagent {
         QosManager::getIngressQosConfigState(const string& interface) const {
             return getQosConfig(interface, false);
         }
+
+
+    void QosManager::updateQosConfigState(const shared_ptr<modelgbp::qos::DscpMarking>& qosconfig) {
+        lock_guard<recursive_mutex> guard(opflexagent::QosManager::qos_mutex);
+        LOG(INFO) << "DscpMarkingUri: " << qosconfig->getURI().toString();
+
+        string dscpMarking("QosDscpMarking/");
+        string dscpMarkingUri(qosconfig->getURI().toString());
+        dscpMarkingUri.erase(dscpMarkingUri.length()-dscpMarking.size());
+
+        URI reqUri(dscpMarkingUri);
+        reqToDscp.erase(reqUri);
+        uint8_t dscp = qosconfig->getMark().get();
+        LOG(INFO) << "Dscp-mark: " <<dscp;
+        reqToDscp.insert(make_pair(reqUri, dscp));
+    }
 
 
     void QosManager::updateQosConfigState(const shared_ptr<modelgbp::qos::BandwidthLimit>& qosconfig) {
@@ -279,6 +381,11 @@ namespace opflexagent {
         lock_guard<recursive_mutex> guard(opflexagent::QosManager::qos_mutex);
         LOG(INFO) << "Requirement URI: " << qosconfig->getURI().toString();
 
+        optional<shared_ptr<modelgbp::qos::DscpMarking> > dscpMarking =
+            qosconfig->resolveQosDscpMarking();
+        if (dscpMarking){
+            updateQosConfigState(dscpMarking.get());
+        }
         optional<shared_ptr<modelgbp::qos::RequirementToEgressRSrc> > rsEgress =
             qosconfig->resolveQosRequirementToEgressRSrc();
         optional<URI> egressUri;
@@ -291,6 +398,7 @@ namespace opflexagent {
             if (egressUri){
                 LOG(INFO) << "Egress URI: " << egressUri.get().toString();
                 updateEntry(ReqUri, egressUri.get(), egressPolInterface);
+                updateEntry(ReqUri, egressUri.get(), egressPolEpg);
             }
         }
 
@@ -303,11 +411,13 @@ namespace opflexagent {
             if (ingressUri){
                 LOG(INFO) << "Ingress URI: " << ingressUri.get().toString();
                 updateEntry(ReqUri, ingressUri.get(), ingressPolInterface);
+                updateEntry(ReqUri, ingressUri.get(), ingressPolEpg);
             }
         }
 
         reqToPol.insert(make_pair(qosconfig->getURI(), make_pair(egressUri,ingressUri)));
     }
+
 
     void QosManager::QosUniverseListener::processQosConfig(const shared_ptr<modelgbp::qos::Requirement>& qosconfig) {
         qosmanager.updateQosConfigState(qosconfig);
@@ -317,23 +427,70 @@ namespace opflexagent {
         qosmanager.updateQosConfigState(qosconfig);
     }
 
+   void QosManager::QosUniverseListener::processQosConfig(const shared_ptr<modelgbp::qos::DscpMarking>& qosconfig) {
+        qosmanager.updateQosConfigState(qosconfig);
+    }
+
+
+    void QosManager::QosUniverseListener::updateInterfaces(const URI& updatedUri, const string &dir,
+            const unordered_map<URI, unordered_set<string>>& policyMap) {
+        auto itr = policyMap.find(updatedUri);
+        if (itr != policyMap.end()){
+            const unordered_set<string> &interfaces = itr->second;
+            for( const string& interface : interfaces){
+                string taskId = updatedUri.toString()+ interface + dir;
+                qosmanager.taskQueue.dispatch(taskId, [=]() {
+                        qosmanager.notifyListeners(interface, dir);
+                        });
+            }
+        }
+    }
+
+    void QosManager::QosUniverseListener::processModbUpdate(const URI& updatedUri, const string &dir,
+            const unordered_map<URI, unordered_set<string>>& policyMap){
+        updateInterfaces(updatedUri, dir, policyMap);
+    }
+
+    void QosManager::QosUniverseListener::processModbUpdate(const URI& updatedUri, const string& dir,
+            const unordered_map<URI, unordered_set<URI>>& policyMap){
+        auto itr1 = policyMap.find(updatedUri);
+        if (itr1 != policyMap.end()){
+            const unordered_set<URI> &epgs = itr1->second;
+            for( const URI& epg : epgs){
+                updateInterfaces(epg, dir, qosmanager.epgToInterface);
+            }
+        }
+    }
+
     void QosManager::clearEntry(const string& interface, const URI& uri, unordered_map<URI, unordered_set<string>>& policyMap){
-	    auto itr = policyMap.find(uri);
-	    if (itr != policyMap.end()){
-		    itr->second.erase(interface);
-	    }
+        auto itr = policyMap.find(uri);
+        if (itr != policyMap.end()){
+            itr->second.erase(interface);
+        }
+    }
+
+    void QosManager::clearEntry(const URI& epg, const URI& uri, unordered_map<URI, unordered_set<URI>>& policyMap){
+        auto itr = policyMap.find(uri);
+        if (itr != policyMap.end()){
+            itr->second.erase(epg);
+        }
     }
 
     void QosManager::clearEntry(const URI& reqUri){
-        optional<URI> egressUri;
+		optional<URI> egressUri;
         optional<URI> ingressUri;
         unordered_set<string> reqInterfaces;
+        unordered_set<URI> reqEpgs;
+
+        auto itr = reqToEpg.find(reqUri);
+        if (itr != reqToEpg.end()){
+            reqEpgs = itr->second;
+        }
 
         auto itr1 = reqToInterface.find(reqUri);
-        if (itr1 == reqToInterface.end()){
-            return;
+        if (itr1 != reqToInterface.end()){
+            reqInterfaces = itr1->second;
         }
-        reqInterfaces = itr1->second;
 
         auto itr2 = reqToPol.find(reqUri);
         if (itr2 != reqToPol.end()){
@@ -349,7 +506,14 @@ namespace opflexagent {
                 for(const auto& intf : reqInterfaces){
                     updateInterfaces.erase(intf);
                 }
+            }
 
+            auto itr4 = egressPolEpg.find(egressUri.get());
+            if (itr4 != egressPolEpg.end()){
+                unordered_set<URI> & updateEpgs = itr4->second;
+                for(const auto& epg : reqEpgs){
+                    updateEpgs.erase(epg);
+                }
             }
         }
 
@@ -359,6 +523,14 @@ namespace opflexagent {
                 unordered_set<string> & updateInterfaces = itr3->second;
                 for(const auto& intf : reqInterfaces){
                     updateInterfaces.erase(intf);
+                }
+            }
+
+            auto itr4 = ingressPolEpg.find(ingressUri.get());
+            if (itr4 != ingressPolEpg.end()){
+                unordered_set<URI> & updateEpgs = itr4->second;
+                for(const auto& epg : reqEpgs){
+                    updateEpgs.erase(epg);
                 }
             }
         }
@@ -381,15 +553,42 @@ namespace opflexagent {
         }
     }
 
+    void QosManager::updateEntry(const URI& reqUri, const URI& dirUri, unordered_map<URI, unordered_set<URI>>& policyMap){
+        auto itr1 = reqToEpg.find(reqUri);
+        if (itr1 == reqToEpg.end()){
+            return;
+        }
+        unordered_set<URI> epgs = itr1->second;
+        auto itr2 = policyMap.find(dirUri);
+        if (itr2 == policyMap.end()){
+            policyMap.insert(make_pair(dirUri, epgs));
+            return;
+        }
+        unordered_set<URI> &updateEpgs = itr2->second;
+        for(const auto& epg : epgs){
+            updateEpgs.insert(epg);
+        }
+    }
+
     void QosManager::addEntry(const string& interface, const URI& uri, unordered_map<URI, unordered_set<string>>& policyMap){
         auto itr = policyMap.find(uri);
         if (itr != policyMap.end()){
-            unordered_set<string> &interfaces = itr->second;
-            interfaces.insert(interface);
+            itr->second.insert(interface);
         }else{
             unordered_set<string> interfaces;
             interfaces.insert(interface);
             policyMap.insert(make_pair(uri, interfaces));
+        }
+    }
+
+    void QosManager::addEntry(const URI& epg, const URI& uri, unordered_map<URI, unordered_set<URI>>& policyMap){
+        auto itr = policyMap.find(uri);
+        if (itr != policyMap.end()){
+            itr->second.insert(epg);
+        }else{
+            unordered_set<URI> epgs;
+            epgs.insert(epg);
+            policyMap.insert(make_pair(uri, epgs));
         }
     }
 
@@ -416,6 +615,29 @@ namespace opflexagent {
 
     }
 
+    void QosManager::clearEpgEntry(const URI & epg){
+        auto itr = epgToReq.find(epg);
+        if (itr != epgToReq.end()){
+            const URI oldReq = itr->second;
+            epgToReq.erase(itr);
+
+            auto itr2 = reqToPol.find(oldReq);
+            if (itr2 != reqToPol.end()){
+                const optional<URI> oldEgress = itr2->second.first;
+                const optional<URI> oldIngress = itr2->second.second;
+                if (oldEgress){
+                    clearEntry(epg, oldEgress.get(), egressPolEpg);
+                }
+
+                if (oldIngress){
+                    clearEntry(epg, oldIngress.get(), ingressPolEpg);
+                }
+            }
+            clearEntry(epg, oldReq, reqToEpg);
+        }
+
+    }
+
     void QosManager::updateInterfacePolicyMap(const string& interface, const URI& newReq){
         clearInterfaceEntry(interface);
         interfaceToReq.insert(make_pair(interface, newReq));
@@ -435,6 +657,27 @@ namespace opflexagent {
             }
         }
     }
+
+    void QosManager::updateEpgPolicyMap(const URI& epg, const URI& newReq){
+        clearEpgEntry(epg);
+        epgToReq.insert(make_pair(epg, newReq));
+        addEntry(epg, newReq, reqToEpg);
+
+        auto itr3 = reqToPol.find(newReq);
+        if (itr3 != reqToPol.end()){
+            const optional<URI> newEgress = itr3->second.first;
+            const optional<URI> newIngress = itr3->second.second;
+
+            if (newEgress){
+                addEntry(epg, newEgress.get(), egressPolEpg);
+            }
+
+            if (newIngress){
+                addEntry(epg, newIngress.get(), ingressPolEpg);
+            }
+        }
+    }
+
 
 }
 
