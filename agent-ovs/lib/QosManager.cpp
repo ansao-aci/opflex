@@ -186,6 +186,11 @@ namespace opflexagent {
         const optional<string>& ofPortName = endpoint.getAccessInterface();
         const optional<URI>& egUri = endpoint.getEgURI();
 
+        if (endpoint.isPromiscuousMode()){
+            LOG(DEBUG) << "skipping qos configuration for infra port: " << uuid;
+            return;
+        }
+
         if (ofPortName){
             optional<URI> qosUri = boost::none;
             const string &interface = ofPortName.get();
